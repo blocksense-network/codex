@@ -49,6 +49,7 @@ yarn-error.log*
 # env
 .env*
 !.env.example
+!.envrc
 
 # package
 *.tgz
@@ -80,4 +81,3 @@ CHANGELOG.ignore.md
 
 # nix related
 .direnv
-.envrc

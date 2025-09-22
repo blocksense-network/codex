@@ -410,15 +410,15 @@ impl Session {
         // - spin up MCP connection manager
         // - perform default shell discovery
         // - load history metadata
-        let rollout_fut = RolloutRecorder::new(&config, rollout_params);
+        let rollout_recorder = RolloutRecorder::new(&config, rollout_params);
 
         let mcp_fut = McpConnectionManager::new(config.mcp_servers.clone());
         let default_shell_fut = shell::default_user_shell();
         let history_meta_fut = crate::message_history::history_metadata(&config);
 
         // Join all independent futures.
-        let (rollout_recorder, mcp_res, default_shell, (history_log_id, history_entry_count)) =
-            tokio::join!(rollout_fut, mcp_fut, default_shell_fut, history_meta_fut);
+        let (mcp_res, default_shell, (history_log_id, history_entry_count)) =
+            tokio::join!(mcp_fut, default_shell_fut, history_meta_fut);
 
         let rollout_recorder = rollout_recorder.map_err(|e| {
             error!("failed to initialize rollout recorder: {e:#}");
@@ -561,7 +561,7 @@ impl Session {
             InitialHistory::New => {
                 // Build and record initial items (user instructions + environment context)
                 let items = self.build_initial_context(turn_context);
-                self.record_conversation_items(&items).await;
+                self.record_conversation_items(&items);
             }
             InitialHistory::Resumed(_) | InitialHistory::Forked(_) => {
                 let rollout_items = conversation_history.get_rollout_items();
@@ -576,7 +576,7 @@ impl Session {
 
                 // If persisting, persist all rollout items as-is (recorder filters)
                 if persist && !rollout_items.is_empty() {
-                    self.persist_rollout_items(&rollout_items).await;
+                    self.persist_rollout_items(&rollout_items);
                 }
             }
         }
@@ -586,7 +586,7 @@ impl Session {
     pub(crate) async fn send_event(&self, event: Event) {
         // Persist the event into rollout (recorder filters as needed)
         let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
-        self.persist_rollout_items(&rollout_items).await;
+        self.persist_rollout_items(&rollout_items);
         if let Err(e) = self.tx_event.send(event).await {
             error!("failed to send tool call event: {e}");
         }
@@ -678,9 +678,9 @@ impl Session {
 
     /// Records input items: always append to conversation history and
     /// persist these response items to rollout.
-    async fn record_conversation_items(&self, items: &[ResponseItem]) {
+    fn record_conversation_items(&self, items: &[ResponseItem]) {
         self.record_into_history(items);
-        self.persist_rollout_response_items(items).await;
+        self.persist_rollout_response_items(items);
     }
 
     fn reconstruct_history_from_rollout(
@@ -718,13 +718,13 @@ impl Session {
             .record_items(items.iter());
     }
 
-    async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
+    fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
         let rollout_items: Vec<RolloutItem> = items
             .iter()
             .cloned()
             .map(RolloutItem::ResponseItem)
             .collect();
-        self.persist_rollout_items(&rollout_items).await;
+        self.persist_rollout_items(&rollout_items);
     }
 
     fn build_initial_context(&self, turn_context: &TurnContext) -> Vec<ResponseItem> {
@@ -741,13 +741,13 @@ impl Session {
         items
     }
 
-    async fn persist_rollout_items(&self, items: &[RolloutItem]) {
+    fn persist_rollout_items(&self, items: &[RolloutItem]) {
         let recorder = {
             let guard = self.rollout.lock_unchecked();
             guard.as_ref().cloned()
         };
         if let Some(rec) = recorder
-            && let Err(e) = rec.record_items(items).await
+            && let Err(e) = rec.record_items(items)
         {
             error!("failed to record rollout items: {e:#}");
         }
@@ -773,8 +773,7 @@ impl Session {
     async fn record_input_and_rollout_usermsg(&self, response_input: &ResponseInputItem) {
         let response_item: ResponseItem = response_input.clone().into();
         // Add to conversation history and persist response item to rollout
-        self.record_conversation_items(std::slice::from_ref(&response_item))
-            .await;
+        self.record_conversation_items(std::slice::from_ref(&response_item));
 
         // Derive user message events and persist only UserMessage to rollout
         let msgs =
@@ -787,7 +786,7 @@ impl Session {
             })
             .collect();
         if !user_msgs.is_empty() {
-            self.persist_rollout_items(&user_msgs).await;
+            self.persist_rollout_items(&user_msgs);
         }
     }
 
@@ -1271,8 +1270,7 @@ async fn submission_loop(
                         sandbox_policy,
                         // Shell is not configurable from turn to turn
                         None,
-                    ))])
-                    .await;
+                    ))]);
                 }
             }
             Op::UserInput { items } => {
@@ -1350,8 +1348,7 @@ async fn submission_loop(
                     let previous_env_context = EnvironmentContext::from(turn_context.as_ref());
                     let new_env_context = EnvironmentContext::from(&fresh_turn_context);
                     if !new_env_context.equals_except_shell(&previous_env_context) {
-                        sess.record_conversation_items(&[ResponseItem::from(new_env_context)])
-                            .await;
+                        sess.record_conversation_items(&[ResponseItem::from(new_env_context)]);
                     }
 
                     // Install the new persistent context for subsequent tasks/turns.
@@ -1470,7 +1467,7 @@ async fn submission_loop(
                 // that inspect the rollout file do not race with the background writer.
                 let recorder_opt = sess.rollout.lock_unchecked().take();
                 if let Some(rec) = recorder_opt
-                    && let Err(e) = rec.shutdown().await
+                    && let Err(e) = rec.shutdown()
                 {
                     warn!("failed to shutdown rollout recorder: {e}");
                     let event = Event {
@@ -1503,7 +1500,7 @@ async fn submission_loop(
                     }
                 };
                 if let Some(rec) = rec_opt
-                    && let Err(e) = rec.flush().await
+                    && let Err(e) = rec.flush()
                 {
                     warn!("failed to flush rollout recorder before GetHistory: {e}");
                 }
@@ -1695,7 +1692,7 @@ async fn run_task(
             }
             review_thread_history.clone()
         } else {
-            sess.record_conversation_items(&pending_input).await;
+            sess.record_conversation_items(&pending_input);
             sess.turn_input_with_history(pending_input)
         };
 
@@ -1835,8 +1832,7 @@ async fn run_task(
                         review_thread_history
                             .extend(items_to_record_in_conversation_history.clone());
                     } else {
-                        sess.record_conversation_items(&items_to_record_in_conversation_history)
-                            .await;
+                        sess.record_conversation_items(&items_to_record_in_conversation_history);
                     }
                 }
 
@@ -2087,7 +2083,7 @@ async fn try_run_turn(
         effort: turn_context.client.get_reasoning_effort(),
         summary: turn_context.client.get_reasoning_summary(),
     });
-    sess.persist_rollout_items(&[rollout_item]).await;
+    sess.persist_rollout_items(&[rollout_item]);
     let mut stream = turn_context.client.clone().stream(&prompt).await?;
 
     let mut output = Vec::new();
@@ -3311,8 +3307,7 @@ async fn exit_review_mode(
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText { text: user_message }],
-        }])
-        .await;
+        }]);
 }
 
 #[cfg(test)]

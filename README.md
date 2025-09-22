@@ -99,7 +99,53 @@ Codex CLI supports a rich set of configuration options, with preferences stored 
 
 ---
 
+## Agents Workflow Additions
+
+### Rollout Entry Hooks
+
+Codex CLI supports executing custom hook commands after each rollout entry is written to disk. This enables integrations with external monitoring, logging, or processing systems.
+
+#### CLI Usage
+
+```shell
+codex --rollout-hook "my-hook-script.sh" "arg1" "arg2"
+```
+
+#### Configuration File
+
+Add to `~/.codex/config.toml`:
+
+```toml
+rollout_entry_hook = ["my-hook-script.sh", "arg1", "arg2"]
+```
+
+#### Hook Behavior
+
+- **When**: Executed after each `RolloutItem` is written to the session file
+- **Input**: Hook receives the JSON representation of the written entry as its last argument
+- **Error Handling**: Hook failures don't interrupt session recording
+- **Performance**: Hooks run synchronously and should be lightweight
+
+#### Example Hook Script
+
+```bash
+#!/bin/bash
+# Example hook that logs rollout entries
+ENTRY_JSON="$1"
+echo "$(date): Rollout entry written - $ENTRY_JSON" >> /var/log/codex-rollouts.log
+```
+
+#### Use Cases
+
+- **Real-time monitoring** of agent activity
+- **Data pipeline integration** for analytics
+- **Custom logging** with external systems
+- **Automated processing** of conversation data
+
+---
+
 ## License
 
 This repository is licensed under the [Apache-2.0 License](LICENSE).
 
+# Integration with agents-workflow

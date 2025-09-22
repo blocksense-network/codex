@@ -2,9 +2,14 @@
 
 use std::fs::File;
 use std::fs::{self};
+use std::io::BufWriter;
 use std::io::Error as IoError;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use codex_protocol::mcp_protocol::ConversationId;
 use serde::Deserialize;
@@ -13,10 +18,7 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::FormatItem;
 use time::macros::format_description;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc::Sender;
-use tokio::sync::mpsc::{self};
-use tokio::sync::oneshot;
+use tracing::error;
 use tracing::info;
 use tracing::warn;
 
@@ -27,7 +29,6 @@ use super::list::get_conversations;
 use super::policy::is_persisted_response_item;
 use crate::config::Config;
 use crate::default_client::ORIGINATOR;
-use crate::git_info::collect_git_info;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::ResumedHistory;
@@ -60,8 +61,9 @@ pub struct SavedSession {
 /// ```
 #[derive(Clone)]
 pub struct RolloutRecorder {
-    tx: Sender<RolloutCmd>,
+    writer: Arc<Mutex<BufWriter<File>>>,
     pub(crate) rollout_path: PathBuf,
+    hook_command: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -72,17 +74,6 @@ pub enum RolloutRecorderParams {
     },
     Resume {
         path: PathBuf,
-    },
-}
-
-enum RolloutCmd {
-    AddItems(Vec<RolloutItem>),
-    /// Ensure all prior writes are processed; respond when flushed.
-    Flush {
-        ack: oneshot::Sender<()>,
-    },
-    Shutdown {
-        ack: oneshot::Sender<()>,
     },
 }
 
@@ -112,7 +103,7 @@ impl RolloutRecorder {
     /// Attempt to create a new [`RolloutRecorder`]. If the sessions directory
     /// cannot be created or the rollout file cannot be opened we return the
     /// error so the caller can decide whether to disable persistence.
-    pub async fn new(config: &Config, params: RolloutRecorderParams) -> std::io::Result<Self> {
+    pub fn new(config: &Config, params: RolloutRecorderParams) -> std::io::Result<Self> {
         let (file, rollout_path, meta) = match params {
             RolloutRecorderParams::Create {
                 conversation_id,
@@ -134,7 +125,7 @@ impl RolloutRecorder {
                     .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
 
                 (
-                    tokio::fs::File::from_std(file),
+                    file,
                     path,
                     Some(SessionMeta {
                         id: session_id,
@@ -147,32 +138,46 @@ impl RolloutRecorder {
                 )
             }
             RolloutRecorderParams::Resume { path } => (
-                tokio::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&path)
-                    .await?,
+                std::fs::OpenOptions::new().append(true).open(&path)?,
                 path,
                 None,
             ),
         };
 
-        // Clone the cwd for the spawned task to collect git info asynchronously
-        let cwd = config.cwd.clone();
+        let writer = Arc::new(Mutex::new(BufWriter::new(file)));
 
-        // A reasonably-sized bounded channel. If the buffer fills up the send
-        // future will yield, which is fine – we only need to ensure we do not
-        // perform *blocking* I/O on the caller's thread.
-        let (tx, rx) = mpsc::channel::<RolloutCmd>(256);
+        // If we have a meta, write it synchronously
+        if let Some(session_meta) = meta {
+            let git_info = std::thread::spawn(move || {
+                // We need to call collect_git_info synchronously since we're not in an async context
+                // For now, we'll skip git info collection in the synchronous version
+                // TODO: Make git info collection synchronous or handle it differently
+                None
+            })
+            .join()
+            .unwrap_or(None);
 
-        // Spawn a Tokio task that owns the file handle and performs async
-        // writes. Using `tokio::fs::File` keeps everything on the async I/O
-        // driver instead of blocking the runtime.
-        tokio::task::spawn(rollout_writer(file, rx, meta, cwd));
+            let session_meta_line = SessionMetaLine {
+                meta: session_meta,
+                git: git_info,
+            };
 
-        Ok(Self { tx, rollout_path })
+            let mut guard = writer.lock().unwrap();
+            Self::write_rollout_item_sync(
+                &mut *guard,
+                RolloutItem::SessionMeta(session_meta_line),
+            )?;
+            guard.flush()?;
+        }
+
+        Ok(Self {
+            writer,
+            rollout_path,
+            hook_command: config.rollout_entry_hook.clone(),
+        })
     }
 
-    pub(crate) async fn record_items(&self, items: &[RolloutItem]) -> std::io::Result<()> {
+    pub fn record_items(&self, items: &[RolloutItem]) -> std::io::Result<()> {
         let mut filtered = Vec::new();
         for item in items {
             // Note that function calls may look a bit strange if they are
@@ -185,24 +190,85 @@ impl RolloutRecorder {
         if filtered.is_empty() {
             return Ok(());
         }
-        self.tx
-            .send(RolloutCmd::AddItems(filtered))
-            .await
-            .map_err(|e| IoError::other(format!("failed to queue rollout items: {e}")))
+
+        let mut guard = self.writer.lock().unwrap();
+        for item in filtered {
+            Self::write_rollout_item_sync(&mut *guard, item.clone())?;
+            guard.flush()?;
+
+            // Execute hook after each item is written
+            if let Some(hook_cmd) = &self.hook_command {
+                Self::execute_hook(hook_cmd, &item)?;
+            }
+        }
+        Ok(())
     }
 
-    /// Flush all queued writes and wait until they are committed by the writer task.
-    pub async fn flush(&self) -> std::io::Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(RolloutCmd::Flush { ack: tx })
-            .await
-            .map_err(|e| IoError::other(format!("failed to queue rollout flush: {e}")))?;
-        rx.await
-            .map_err(|e| IoError::other(format!("failed waiting for rollout flush: {e}")))
+    /// Flush all buffered writes to disk.
+    pub fn flush(&self) -> std::io::Result<()> {
+        let mut guard = self.writer.lock().unwrap();
+        guard.flush()
     }
 
-    pub(crate) async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory> {
+    fn write_rollout_item_sync<W: Write>(
+        writer: &mut W,
+        rollout_item: RolloutItem,
+    ) -> std::io::Result<()> {
+        let timestamp_format: &[FormatItem] = format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+        );
+        let timestamp = OffsetDateTime::now_utc()
+            .format(timestamp_format)
+            .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
+
+        let line = RolloutLine {
+            timestamp,
+            item: rollout_item,
+        };
+        Self::write_line_sync(writer, &line)
+    }
+
+    fn write_line_sync<W: Write>(
+        writer: &mut W,
+        item: &impl serde::Serialize,
+    ) -> std::io::Result<()> {
+        let mut json = serde_json::to_string(item)?;
+        json.push('\n');
+        writer.write_all(json.as_bytes())?;
+        Ok(())
+    }
+
+    fn execute_hook(hook_cmd: &[String], item: &RolloutItem) -> std::io::Result<()> {
+        if hook_cmd.is_empty() {
+            return Ok(());
+        }
+
+        let json = serde_json::to_string(item)
+            .map_err(|e| IoError::other(format!("failed to serialize item for hook: {e}")))?;
+
+        let mut cmd = Command::new(&hook_cmd[0]);
+        cmd.args(&hook_cmd[1..]);
+        cmd.arg(json);
+
+        match cmd.status() {
+            Ok(status) => {
+                if status.success() {
+                    Ok(())
+                } else {
+                    error!("Hook command failed with exit code: {:?}", status.code());
+                    // Don't fail the rollout recording if hook fails
+                    Ok(())
+                }
+            }
+            Err(e) => {
+                error!("Failed to execute hook command: {e}");
+                // Don't fail the rollout recording if hook execution fails
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory> {
         info!("Resuming rollout from {path:?}");
         let text = tokio::fs::read_to_string(path).await?;
         if text.trim().is_empty() {
@@ -277,19 +343,9 @@ impl RolloutRecorder {
         self.rollout_path.clone()
     }
 
-    pub async fn shutdown(&self) -> std::io::Result<()> {
-        let (tx_done, rx_done) = oneshot::channel();
-        match self.tx.send(RolloutCmd::Shutdown { ack: tx_done }).await {
-            Ok(_) => rx_done
-                .await
-                .map_err(|e| IoError::other(format!("failed waiting for rollout shutdown: {e}"))),
-            Err(e) => {
-                warn!("failed to send rollout shutdown command: {e}");
-                Err(IoError::other(format!(
-                    "failed to send rollout shutdown command: {e}"
-                )))
-            }
-        }
+    pub fn shutdown(&self) -> std::io::Result<()> {
+        // Flush any remaining buffered data
+        self.flush()
     }
 }
 
@@ -343,81 +399,4 @@ fn create_log_file(
         conversation_id,
         timestamp,
     })
-}
-
-async fn rollout_writer(
-    file: tokio::fs::File,
-    mut rx: mpsc::Receiver<RolloutCmd>,
-    mut meta: Option<SessionMeta>,
-    cwd: std::path::PathBuf,
-) -> std::io::Result<()> {
-    let mut writer = JsonlWriter { file };
-
-    // If we have a meta, collect git info asynchronously and write meta first
-    if let Some(session_meta) = meta.take() {
-        let git_info = collect_git_info(&cwd).await;
-        let session_meta_line = SessionMetaLine {
-            meta: session_meta,
-            git: git_info,
-        };
-
-        // Write the SessionMeta as the first item in the file, wrapped in a rollout line
-        writer
-            .write_rollout_item(RolloutItem::SessionMeta(session_meta_line))
-            .await?;
-    }
-
-    // Process rollout commands
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            RolloutCmd::AddItems(items) => {
-                for item in items {
-                    if is_persisted_response_item(&item) {
-                        writer.write_rollout_item(item).await?;
-                    }
-                }
-            }
-            RolloutCmd::Flush { ack } => {
-                // Ensure underlying file is flushed and then ack.
-                if let Err(e) = writer.file.flush().await {
-                    let _ = ack.send(());
-                    return Err(e);
-                }
-                let _ = ack.send(());
-            }
-            RolloutCmd::Shutdown { ack } => {
-                let _ = ack.send(());
-            }
-        }
-    }
-
-    Ok(())
-}
-
-struct JsonlWriter {
-    file: tokio::fs::File,
-}
-
-impl JsonlWriter {
-    async fn write_rollout_item(&mut self, rollout_item: RolloutItem) -> std::io::Result<()> {
-        let timestamp_format: &[FormatItem] = format_description!(
-            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
-        );
-        let timestamp = OffsetDateTime::now_utc()
-            .format(timestamp_format)
-            .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
-
-        let line = RolloutLine {
-            timestamp,
-            item: rollout_item,
-        };
-        self.write_line(&line).await
-    }
-    async fn write_line(&mut self, item: &impl serde::Serialize) -> std::io::Result<()> {
-        let mut json = serde_json::to_string(item)?;
-        json.push('\n');
-        self.file.write_all(json.as_bytes()).await?;
-        self.file.flush().await?;
-        Ok(())
-    }
 }

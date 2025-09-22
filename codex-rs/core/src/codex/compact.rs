@@ -128,7 +128,7 @@ async fn run_compact_task_inner(
         effort: turn_context.client.get_reasoning_effort(),
         summary: turn_context.client.get_reasoning_summary(),
     });
-    sess.persist_rollout_items(&[rollout_item]).await;
+    sess.persist_rollout_items(&[rollout_item]);
 
     loop {
         let attempt_result = drain_to_completed(&sess, turn_context.as_ref(), &prompt).await;
@@ -186,7 +186,7 @@ async fn run_compact_task_inner(
     let rollout_item = RolloutItem::Compacted(CompactedItem {
         message: summary_text.clone(),
     });
-    sess.persist_rollout_items(&[rollout_item]).await;
+    sess.persist_rollout_items(&[rollout_item]);
 
     let event = Event {
         id: sub_id.clone(),

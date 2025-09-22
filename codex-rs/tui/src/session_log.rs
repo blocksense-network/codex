@@ -96,6 +96,7 @@ pub(crate) fn maybe_init(config: &Config) {
             Ok(dir) => dir,
             Err(_) => std::env::temp_dir(),
         };
+
         let filename = format!(
             "session-{}.jsonl",
             chrono::Utc::now().format("%Y%m%dT%H%M%SZ")

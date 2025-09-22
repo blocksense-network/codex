@@ -147,6 +147,11 @@ pub struct Config {
     /// output will be hyperlinked using the specified URI scheme.
     pub file_opener: UriBasedFileOpener,
 
+    /// Optional hook command to execute after each rollout entry is written.
+    /// The command receives the JSON representation of the written entry as its
+    /// last argument. If unset, no hook is executed.
+    pub rollout_entry_hook: Option<Vec<String>>,
+
     /// Path to the `codex-linux-sandbox` executable. This must be set if
     /// [`crate::exec::SandboxType::LinuxSeccomp`] is used. Note that this
     /// cannot be set in the config file: it must be set in code via
@@ -665,6 +670,11 @@ pub struct ConfigToml {
     /// output will be hyperlinked using the specified URI scheme.
     pub file_opener: Option<UriBasedFileOpener>,
 
+    /// Optional hook command to execute after each rollout entry is written.
+    /// The command receives the JSON representation of the written entry as its
+    /// last argument. If unset, no hook is executed.
+    pub rollout_entry_hook: Option<Vec<String>>,
+
     /// Collection of settings that are specific to the TUI.
     pub tui: Option<Tui>,
 
@@ -845,6 +855,7 @@ pub struct ConfigOverrides {
     pub include_view_image_tool: Option<bool>,
     pub show_raw_agent_reasoning: Option<bool>,
     pub tools_web_search_request: Option<bool>,
+    pub rollout_entry_hook: Option<Vec<String>>,
 }
 
 impl Config {
@@ -873,6 +884,7 @@ impl Config {
             include_view_image_tool,
             show_raw_agent_reasoning,
             tools_web_search_request: override_tools_web_search_request,
+            rollout_entry_hook,
         } = overrides;
 
         let active_profile_name = config_profile_key
@@ -1053,6 +1065,7 @@ impl Config {
                 .as_ref()
                 .map(|t| t.notifications.clone())
                 .unwrap_or_default(),
+            rollout_entry_hook: rollout_entry_hook.or(cfg.rollout_entry_hook),
         };
         Ok(config)
     }
