@@ -71,8 +71,7 @@ async fn run_remote_compact_task_inner_impl(
         message: String::new(),
         replacement_history: Some(new_history),
     };
-    sess.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
-        .await;
+    sess.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)]).await;
 
     let event = EventMsg::AgentMessage(AgentMessageEvent {
         message: "Compact task completed".to_string(),

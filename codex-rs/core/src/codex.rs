@@ -488,13 +488,16 @@ impl Session {
             ),
         };
 
+        // Initialize RolloutRecorder synchronously
+        let rollout_recorder = RolloutRecorder::new(&config, rollout_params).map_err(|e| {
+            error!("failed to initialize rollout recorder: {e:#}");
+            anyhow::anyhow!("failed to initialize rollout recorder: {e:#}")
+        })?;
+
         // Kick off independent async setup tasks in parallel to reduce startup latency.
         //
-        // - initialize RolloutRecorder with new or resumed session info
         // - perform default shell discovery
         // - load history metadata
-        let rollout_fut = RolloutRecorder::new(&config, rollout_params);
-
         let default_shell = shell::default_user_shell();
         let history_meta_fut = crate::message_history::history_metadata(&config);
         let auth_statuses_fut = compute_auth_statuses(
@@ -503,13 +506,8 @@ impl Session {
         );
 
         // Join all independent futures.
-        let (rollout_recorder, (history_log_id, history_entry_count), auth_statuses) =
-            tokio::join!(rollout_fut, history_meta_fut, auth_statuses_fut);
-
-        let rollout_recorder = rollout_recorder.map_err(|e| {
-            error!("failed to initialize rollout recorder: {e:#}");
-            anyhow::anyhow!("failed to initialize rollout recorder: {e:#}")
-        })?;
+        let ((history_log_id, history_entry_count), auth_statuses) =
+            tokio::join!(history_meta_fut, auth_statuses_fut);
         let rollout_path = rollout_recorder.rollout_path.clone();
 
         let mut post_session_configured_events = Vec::<Event>::new();
@@ -648,7 +646,7 @@ impl Session {
             guard.clone()
         };
         if let Some(rec) = recorder
-            && let Err(e) = rec.flush().await
+            && let Err(e) = rec.flush()
         {
             warn!("failed to flush rollout recorder: {e}");
         }
@@ -1095,10 +1093,10 @@ impl Session {
             let guard = self.services.rollout.lock().await;
             guard.clone()
         };
-        if let Some(rec) = recorder
-            && let Err(e) = rec.record_items(items).await
-        {
-            error!("failed to record rollout items: {e:#}");
+        if let Some(rec) = recorder {
+            if let Err(e) = rec.record_items(items) {
+                error!("failed to record rollout items: {e:#}");
+            }
         }
     }
 
@@ -1754,7 +1752,7 @@ mod handlers {
             guard.take()
         };
         if let Some(rec) = recorder_opt
-            && let Err(e) = rec.shutdown().await
+            && let Err(e) = rec.shutdown()
         {
             warn!("failed to shutdown rollout recorder: {e}");
             let event = Event {
