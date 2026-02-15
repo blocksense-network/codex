@@ -102,6 +102,11 @@ pub struct Cli {
     #[arg(long = "add-dir", value_name = "DIR", value_hint = ValueHint::DirPath)]
     pub add_dir: Vec<PathBuf>,
 
+    /// Hook command to execute after each rollout entry is written.
+    /// The command receives the JSON entry as its last argument.
+    #[arg(long = "rollout-hook", value_name = "CMD", value_delimiter = ',', num_args = 1..)]
+    pub rollout_entry_hook: Option<Vec<String>>,
+
     /// Disable alternate screen mode
     ///
     /// Runs the TUI in inline mode, preserving terminal scrollback history. This is useful
@@ -109,7 +114,6 @@ pub struct Cli {
     /// scrollback in alternate screen buffers.
     #[arg(long = "no-alt-screen", default_value_t = false)]
     pub no_alt_screen: bool,
-
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
 }

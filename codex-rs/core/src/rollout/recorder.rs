@@ -5,6 +5,7 @@ use std::fs::{self};
 use std::io::Error as IoError;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 
 use chrono::SecondsFormat;
 use codex_protocol::ThreadId;
@@ -19,6 +20,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::{self};
 use tokio::sync::oneshot;
+use tracing::error;
 use tracing::info;
 use tracing::trace;
 use tracing::warn;
@@ -72,6 +74,7 @@ pub struct RolloutRecorder {
     pub(crate) rollout_path: PathBuf,
     state_db: Option<StateDbHandle>,
     event_persistence_mode: EventPersistenceMode,
+    hook_command: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -434,6 +437,8 @@ impl RolloutRecorder {
         // perform *blocking* I/O on the caller's thread.
         let (tx, rx) = mpsc::channel::<RolloutCmd>(256);
 
+        let hook_command = config.rollout_entry_hook.clone();
+
         // Spawn a Tokio task that owns the file handle and performs async
         // writes. Using `tokio::fs::File` keeps everything on the async I/O
         // driver instead of blocking the runtime.
@@ -447,6 +452,7 @@ impl RolloutRecorder {
             state_db_ctx.clone(),
             state_builder,
             config.model_provider_id.clone(),
+            hook_command.clone(),
         ));
 
         Ok(Self {
@@ -454,6 +460,7 @@ impl RolloutRecorder {
             rollout_path,
             state_db: state_db_ctx,
             event_persistence_mode,
+            hook_command,
         })
     }
 
@@ -698,12 +705,14 @@ async fn rollout_writer(
     state_db_ctx: Option<StateDbHandle>,
     mut state_builder: Option<ThreadMetadataBuilder>,
     default_provider: String,
+    hook_command: Option<Vec<String>>,
 ) -> std::io::Result<()> {
     let mut writer = file.map(|file| JsonlWriter { file });
     let mut buffered_items = Vec::<RolloutItem>::new();
     if let Some(builder) = state_builder.as_mut() {
         builder.rollout_path = rollout_path.clone();
     }
+    let hook_command_ref = hook_command.as_deref();
 
     // Resumed sessions already have a file handle open, so session metadata can
     // be written immediately if present.
@@ -718,6 +727,7 @@ async fn rollout_writer(
             state_db_ctx.as_deref(),
             &mut state_builder,
             default_provider.as_str(),
+            hook_command_ref,
         )
         .await?;
     }
@@ -746,6 +756,7 @@ async fn rollout_writer(
                     state_db_ctx.as_deref(),
                     &mut state_builder,
                     default_provider.as_str(),
+                    hook_command_ref,
                 )
                 .await?;
             }
@@ -771,6 +782,7 @@ async fn rollout_writer(
                                 state_db_ctx.as_deref(),
                                 &mut state_builder,
                                 default_provider.as_str(),
+                                hook_command_ref,
                             )
                             .await?;
                         }
@@ -783,6 +795,7 @@ async fn rollout_writer(
                                 state_db_ctx.as_deref(),
                                 &mut state_builder,
                                 default_provider.as_str(),
+                                hook_command_ref,
                             )
                             .await?;
                             buffered_items.clear();
@@ -826,6 +839,7 @@ async fn write_session_meta(
     state_db_ctx: Option<&StateRuntime>,
     state_builder: &mut Option<ThreadMetadataBuilder>,
     default_provider: &str,
+    hook_command: Option<&[String]>,
 ) -> std::io::Result<()> {
     let git_info = collect_git_info(cwd).await;
     let session_meta_line = SessionMetaLine {
@@ -838,7 +852,8 @@ async fn write_session_meta(
 
     let rollout_item = RolloutItem::SessionMeta(session_meta_line);
     if let Some(writer) = writer.as_mut() {
-        writer.write_rollout_item(&rollout_item).await?;
+        let json_line = writer.write_rollout_item(&rollout_item).await?;
+        maybe_execute_rollout_hook(hook_command, json_line).await;
     }
     state_db::reconcile_rollout(
         state_db_ctx,
@@ -859,10 +874,12 @@ async fn write_and_reconcile_items(
     state_db_ctx: Option<&StateRuntime>,
     state_builder: &mut Option<ThreadMetadataBuilder>,
     default_provider: &str,
+    hook_command: Option<&[String]>,
 ) -> std::io::Result<()> {
     if let Some(writer) = writer.as_mut() {
         for item in items {
-            writer.write_rollout_item(item).await?;
+            let json_line = writer.write_rollout_item(item).await?;
+            maybe_execute_rollout_hook(hook_command, json_line).await;
         }
     }
     if let Some(builder) = state_builder.as_mut() {
@@ -880,6 +897,40 @@ async fn write_and_reconcile_items(
     Ok(())
 }
 
+async fn maybe_execute_rollout_hook(hook_command: Option<&[String]>, json_line: String) {
+    if let Some(hook_cmd) = hook_command {
+        execute_rollout_hook(hook_cmd, json_line).await;
+    }
+}
+
+async fn execute_rollout_hook(hook_command: &[String], json_line: String) {
+    if hook_command.is_empty() {
+        return;
+    }
+    let hook_cmd = hook_command.to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut cmd = Command::new(&hook_cmd[0]);
+        cmd.args(&hook_cmd[1..]);
+        cmd.arg(json_line);
+        cmd.status()
+    })
+    .await;
+
+    match result {
+        Ok(Ok(status)) => {
+            if !status.success() {
+                error!("rollout hook {:?} exited with {:?}", hook_cmd, status.code());
+            }
+        }
+        Ok(Err(err)) => {
+            error!("failed to execute rollout hook {:?}: {err}", hook_cmd);
+        }
+        Err(err) => {
+            error!("rollout hook task panicked: {err}");
+        }
+    }
+}
+
 struct JsonlWriter {
     file: tokio::fs::File,
 }
@@ -892,7 +943,7 @@ struct RolloutLineRef<'a> {
 }
 
 impl JsonlWriter {
-    async fn write_rollout_item(&mut self, rollout_item: &RolloutItem) -> std::io::Result<()> {
+    async fn write_rollout_item(&mut self, rollout_item: &RolloutItem) -> std::io::Result<String> {
         let timestamp_format: &[FormatItem] = format_description!(
             "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
         );
@@ -904,10 +955,12 @@ impl JsonlWriter {
             timestamp,
             item: rollout_item,
         };
-        self.write_line(&line).await
+        let json = serde_json::to_string(&line)?;
+        self.write_line(&json).await?;
+        Ok(json)
     }
-    async fn write_line(&mut self, item: &impl serde::Serialize) -> std::io::Result<()> {
-        let mut json = serde_json::to_string(item)?;
+    async fn write_line(&mut self, json_line: &str) -> std::io::Result<()> {
+        let mut json = json_line.to_string();
         json.push('\n');
         self.file.write_all(json.as_bytes()).await?;
         self.file.flush().await?;
