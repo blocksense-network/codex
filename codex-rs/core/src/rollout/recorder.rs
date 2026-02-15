@@ -908,6 +908,7 @@ async fn execute_rollout_hook(hook_command: &[String], json_line: String) {
         return;
     }
     let hook_cmd = hook_command.to_owned();
+    let hook_cmd_for_log = hook_cmd.clone();
     let result = tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new(&hook_cmd[0]);
         cmd.args(&hook_cmd[1..]);
@@ -919,11 +920,11 @@ async fn execute_rollout_hook(hook_command: &[String], json_line: String) {
     match result {
         Ok(Ok(status)) => {
             if !status.success() {
-                error!("rollout hook {:?} exited with {:?}", hook_cmd, status.code());
+                error!("rollout hook {:?} exited with {:?}", hook_cmd_for_log, status.code());
             }
         }
         Ok(Err(err)) => {
-            error!("failed to execute rollout hook {:?}: {err}", hook_cmd);
+            error!("failed to execute rollout hook {:?}: {err}", hook_cmd_for_log);
         }
         Err(err) => {
             error!("rollout hook task panicked: {err}");
