@@ -34,6 +34,10 @@ impl codex_rollout::RolloutConfigView for Config {
     fn generate_memories(&self) -> bool {
         self.memories.generate_memories
     }
+
+    fn rollout_entry_hook(&self) -> Option<&Vec<String>> {
+        self.rollout_entry_hook.as_ref()
+    }
 }
 
 pub mod list {

@@ -8,6 +8,10 @@ pub trait RolloutConfigView {
     fn cwd(&self) -> &Path;
     fn model_provider_id(&self) -> &str;
     fn generate_memories(&self) -> bool;
+    /// Optional hook command to execute after each rollout entry is written.
+    fn rollout_entry_hook(&self) -> Option<&Vec<String>> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,6 +21,7 @@ pub struct RolloutConfig {
     pub cwd: PathBuf,
     pub model_provider_id: String,
     pub generate_memories: bool,
+    pub rollout_entry_hook: Option<Vec<String>>,
 }
 
 pub type Config = RolloutConfig;
@@ -29,6 +34,7 @@ impl RolloutConfig {
             cwd: view.cwd().to_path_buf(),
             model_provider_id: view.model_provider_id().to_string(),
             generate_memories: view.generate_memories(),
+            rollout_entry_hook: view.rollout_entry_hook().cloned(),
         }
     }
 }
@@ -53,6 +59,10 @@ impl RolloutConfigView for RolloutConfig {
     fn generate_memories(&self) -> bool {
         self.generate_memories
     }
+
+    fn rollout_entry_hook(&self) -> Option<&Vec<String>> {
+        self.rollout_entry_hook.as_ref()
+    }
 }
 
 impl<T: RolloutConfigView + ?Sized> RolloutConfigView for &T {
@@ -75,6 +85,10 @@ impl<T: RolloutConfigView + ?Sized> RolloutConfigView for &T {
     fn generate_memories(&self) -> bool {
         (*self).generate_memories()
     }
+
+    fn rollout_entry_hook(&self) -> Option<&Vec<String>> {
+        (*self).rollout_entry_hook()
+    }
 }
 
 impl<T: RolloutConfigView + ?Sized> RolloutConfigView for Arc<T> {
@@ -96,5 +110,9 @@ impl<T: RolloutConfigView + ?Sized> RolloutConfigView for Arc<T> {
 
     fn generate_memories(&self) -> bool {
         self.as_ref().generate_memories()
+    }
+
+    fn rollout_entry_hook(&self) -> Option<&Vec<String>> {
+        self.as_ref().rollout_entry_hook()
     }
 }

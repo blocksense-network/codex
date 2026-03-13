@@ -2495,6 +2495,13 @@
       "description": "Review model override used by the `/review` feature.",
       "type": "string"
     },
+    "rollout_entry_hook": {
+      "description": "Optional hook command to execute after each rollout entry is written. The command receives the JSON representation of the written entry as its last argument. If unset, no hook is executed.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "sandbox_mode": {
       "allOf": [
         {
