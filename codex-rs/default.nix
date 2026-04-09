@@ -24,15 +24,15 @@ let
     };
     "x86_64-darwin" = {
       target = "x86_64-apple-darwin";
-      hash = lib.fakeHash; # Fill when needed
+      hash = "sha256-YwzSQPG77NsHFBfcGDh6uBz2fFScHFFaC0/Pnrpke7c=";
     };
     "x86_64-linux" = {
       target = "x86_64-unknown-linux-gnu";
-      hash = lib.fakeHash; # Fill when needed
+      hash = "sha256-5ktNmeSuKTouhGJEqJuAF4uhA4LBP7WRwfppaPUpEVM=";
     };
     "aarch64-linux" = {
       target = "aarch64-unknown-linux-gnu";
-      hash = lib.fakeHash; # Fill when needed
+      hash = "sha256-2/FlsHyBvbBUvARrQ9I+afz3vMGkwbW0d2mDpxBi7Ng=";
     };
   }.${stdenv.hostPlatform.system} or (throw "Unsupported platform for rusty_v8: ${stdenv.hostPlatform.system}");
   rustyV8Archive = fetchurl {
