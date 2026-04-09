@@ -1,5 +1,6 @@
 {
   cmake,
+  fetchurl,
   llvmPackages,
   openssl,
   libcap ? null,
@@ -10,29 +11,54 @@
   version ? "0.0.0",
   ...
 }:
+let
+  # Pre-fetch the rusty_v8 static library required by the v8 crate.
+  # The v8 crate's build.rs tries to download this at build time, which
+  # fails in the Nix sandbox (no network). We fetch it ahead of time
+  # and point RUSTY_V8_ARCHIVE at it.
+  rustyV8Version = "146.4.0";
+  rustyV8 = {
+    "aarch64-darwin" = {
+      target = "aarch64-apple-darwin";
+      hash = "sha256-v+LJvjKlbChUbw+WWCXuaPv2BkBfMQzE4XtEilaM+Yo=";
+    };
+    "x86_64-darwin" = {
+      target = "x86_64-apple-darwin";
+      hash = lib.fakeHash; # Fill when needed
+    };
+    "x86_64-linux" = {
+      target = "x86_64-unknown-linux-gnu";
+      hash = lib.fakeHash; # Fill when needed
+    };
+    "aarch64-linux" = {
+      target = "aarch64-unknown-linux-gnu";
+      hash = lib.fakeHash; # Fill when needed
+    };
+  }.${stdenv.hostPlatform.system} or (throw "Unsupported platform for rusty_v8: ${stdenv.hostPlatform.system}");
+  rustyV8Archive = fetchurl {
+    url = "https://github.com/denoland/rusty_v8/releases/download/v${rustyV8Version}/librusty_v8_release_${rustyV8.target}.a.gz";
+    hash = rustyV8.hash;
+  };
+in
 rustPlatform.buildRustPackage (_: {
   env.PKG_CONFIG_PATH = lib.makeSearchPathOutput "dev" "lib/pkgconfig" (
     [ openssl ] ++ lib.optionals stdenv.isLinux [ libcap ]
   );
+  env.RUSTY_V8_ARCHIVE = rustyV8Archive;
   pname = "codex-rs";
   inherit version;
   cargoLock.lockFile = ./Cargo.lock;
   doCheck = false;
   src = ./.;
 
-  # Patch the workspace Cargo.toml so that cargo embeds the correct version in
-  # CARGO_PKG_VERSION (which the binary reads via env!("CARGO_PKG_VERSION")).
-  # On release commits the Cargo.toml already contains the real version and
-  # this sed is a no-op.
-  # Exclude v8-poc from workspace: it requires downloading a prebuilt V8
-  # binary during build, which doesn't work in the Nix sandbox (no network).
-  # The v8-poc crate is an experimental POC and not needed for the codex CLI.
+  # Patch the workspace Cargo.toml:
+  # 1. Set version from Nix (for dev builds)
+  # 2. Exclude v8-poc from workspace (experimental, not needed for CLI)
   postPatch = ''
     sed -i 's/^version = "0\.0\.0"$/version = "${version}"/' Cargo.toml
     sed -i '/"v8-poc",/d' Cargo.toml
     sed -i '/"codex-v8-poc",/d' Cargo.toml
     sed -i '/codex-v8-poc/d' Cargo.toml
-    sed -i '/^v8 = /d' Cargo.toml
   '';
   nativeBuildInputs = [
     cmake
