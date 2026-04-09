@@ -24,8 +24,15 @@ rustPlatform.buildRustPackage (_: {
   # CARGO_PKG_VERSION (which the binary reads via env!("CARGO_PKG_VERSION")).
   # On release commits the Cargo.toml already contains the real version and
   # this sed is a no-op.
+  # Exclude v8-poc from workspace: it requires downloading a prebuilt V8
+  # binary during build, which doesn't work in the Nix sandbox (no network).
+  # The v8-poc crate is an experimental POC and not needed for the codex CLI.
   postPatch = ''
     sed -i 's/^version = "0\.0\.0"$/version = "${version}"/' Cargo.toml
+    sed -i '/"v8-poc",/d' Cargo.toml
+    sed -i '/"codex-v8-poc",/d' Cargo.toml
+    sed -i '/codex-v8-poc/d' Cargo.toml
+    sed -i '/^v8 = /d' Cargo.toml
   '';
   nativeBuildInputs = [
     cmake
